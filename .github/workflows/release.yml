@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and publish even if the pinned version matches"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31
+
+      # Proton publishes a manifest with the stable channel, its version and
+      # the sha512 of every artifact.
+      - name: Resolve latest stable version
+        id: latest
+        run: |
+          curl -fsSL https://proton.me/download/drive/cli/version.json > "$RUNNER_TEMP/proton.json"
+          jq -r '.Releases[] | select(.CategoryName == "Stable")' "$RUNNER_TEMP/proton.json" > "$RUNNER_TEMP/stable.json"
+          jq -r '.Version' "$RUNNER_TEMP/stable.json" > /dev/null
+          version="$(jq -r '.Version' "$RUNNER_TEMP/stable.json")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare with pinned version
+        id: check
+        run: |
+          current="$(jq -r .version version.json)"
+          echo "pinned=${current}" >> "$GITHUB_OUTPUT"
+          if [ "$current" = "${{ steps.latest.outputs.version }}" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update version and upstream hash
+        id: hashes
+        if: steps.check.outputs.new == 'true'
+        run: |
+          hex="$(jq -r '.Files[] | select(.Url | endswith("linux-x64/proton-drive")) | .Sha512CheckSum' "$RUNNER_TEMP/stable.json")"
+          sri="$(nix hash convert --hash-algo sha512 --to sri "$hex")"
+          jq -n --arg v "${{ steps.latest.outputs.version }}" --arg h "$sri" \
+            '{version: $v, upstreamHash: $h, assets: {}}' > version.json
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build self-contained bundle
+        id: build
+        if: steps.hashes.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          nix bundle --bundler github:NixOS/bundlers#toArx '.#unbundled' -o "$RUNNER_TEMP/proton-arx"
+          cp -L "$RUNNER_TEMP/proton-arx" proton-drive-linux-x86_64
+          bin_sha="$(nix hash file --type sha256 --sri proton-drive-linux-x86_64)"
+
+          jq --arg s "$bin_sha" '.assets["x86_64-linux"] = $s' version.json > version.json.tmp
+          mv version.json.tmp version.json
+          echo "bundle=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release asset
+        if: steps.build.outputs.bundle == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release create "v${VERSION}" --title "proton-drive ${VERSION}" \
+              --notes "Self-contained Proton Drive CLI ${VERSION} bundle (patched binary + runtime libraries)."
+          fi
+          gh release upload "v${VERSION}" proton-drive-linux-x86_64 --clobber
+
+      # The published bundle must satisfy the flake's fixed-output check before
+      # the commit points consumers at it.
+      - name: Verify the flake can consume the bundle
+        if: steps.build.outputs.bundle == 'true'
+        run: nix build --no-link .#default
+
+      - name: Commit and tag
+        if: steps.build.outputs.bundle == 'true'
+        env:
+          VERSION: ${{ steps.latest.outputs.version }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git add version.json flake.lock
+          if ! git diff --cached --quiet; then
+            git commit -m "release: proton-drive ${VERSION}"
+            git push origin HEAD:main
+          fi
+          git tag -f "v${VERSION}"
+          git tag -f latest
+          git push --force origin "v${VERSION}" latest
+
+      - name: Open issue when the build fails
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.latest.outputs.version }}
+        run: |
+          gh issue create \
+            --title "proton-drive ${VERSION}: release build failed" \
+            --body "The release build for proton-drive ${VERSION} failed. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
