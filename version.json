@@ -1,5 +1,7 @@
 {
   "version": "0.9.0",
   "upstreamHash": "sha512-NTMCW6aa4RK2Tj4B+8wa0GiBNqQEP2z2pyiGln2F/c2ewjVHnC4RMXFhS+UiW/upNCdQmgXKWqYHHZJPp+kcqA==",
-  "assets": {}
+  "assets": {
+    "x86_64-linux": "sha256-pnA0ct73vhDJpd9es783UEDORg0FMC25gNZwDFYCMnI="
+  }
 }
